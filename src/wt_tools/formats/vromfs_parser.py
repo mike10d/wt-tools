@@ -1,9 +1,10 @@
 import struct
+import zstandard
 
-import zstd
-from construct import *
+from construct import Construct, Enum, Byte, this, Adapter, Struct, Seek, Int32ul, Array, CString, Tell, If, Bytes, \
+    Computed, Embedded, Switch, Error, Int24ul, Hex, String, Int16ul, GreedyBytes, StringsAsBytes
 
-from formats.common import zlib_stream
+from .common import zlib_stream
 
 NOT_PACKED_ADDED_OFFSET = 0x10
 NOT_PACKED_FILE_DATA_TABLE_OFFSET = 0x20
@@ -25,11 +26,11 @@ class ZstdContext(Construct):
         need_read_size = ctx._._.header.packed_size - (16 if ctx.first_part else 0) - (16 if ctx.second_part else 0)
         # ugly: align read size to 4 bytes
         need_read_size = need_read_size // 4 * 4
-        deobfs_compressed_data = (ctx.first_part if ctx.first_part else '') + \
+        deobfs_compressed_data = (ctx.first_part if ctx.first_part else b'') + \
                                  stream.getvalue()[ctx.middle_data_offset:ctx.middle_data_offset + need_read_size] + \
-                                 (ctx.second_part.data if ctx.second_part.data else '') + \
-                                 (ctx.align_tail if ctx.align_tail else '')
-        dctx = zstd.ZstdDecompressor()
+                                 (ctx.second_part.data if ctx.second_part.data else b'') + \
+                                 (ctx.align_tail if ctx.align_tail else b'')
+        dctx = zstandard.ZstdDecompressor()
         decompressed_data = dctx.decompress(deobfs_compressed_data, max_output_size=ctx._._.header.original_size)
         ctx.parsed_data = vromfs_not_packed_body.parse(decompressed_data)
 
@@ -49,6 +50,19 @@ class Obfs32Adapter(Adapter):
         return struct.pack("<4L", *[x ^ y for (x, y) in zip(obj, [0x12481248, 0xAA55AA55, 0xF00FF00F, 0xAA55AA55])])
 
 
+'''
+struct VirtualRomFsExtHdr {
+    ushort size;
+    ushort flags;
+    uint version;
+};
+'''
+vromfs_ext_header = Struct(
+    "size" / Int16ul,
+    "flags" / Int16ul,
+    "version" / Int32ul
+)
+
 filename_table = Struct(
     # move to start of filename table
     Seek(this._.data_start_offset + this._.filename_table_offset, 0),
@@ -56,7 +70,7 @@ filename_table = Struct(
     # but we cheat, just read total_files * cstrings
     "first_filename_offset" / Int32ul,
     Seek(this._.data_start_offset + this.first_filename_offset),
-    "filenames" / Array(this._.files_count, CString())
+    "filenames" / Array(this._.files_count, CString(encoding="utf8"))
 )
 
 file_data_record = Struct(
@@ -120,14 +134,14 @@ vromfs_zlib_packed_body = Struct(
 )
 
 vromfs_header = Struct(
-    # b"VRFs\x00\x00PC"
-    "magic" / Const(Int64ub, 0x5652467300005043),
+    "magic" / Enum(String(4, encoding=StringsAsBytes), vrfs=b"VRFs", vrfx=b"VRFx"),
+    "platform" / Enum(String(4, encoding=StringsAsBytes), pc=b"\x00\x00PC", ios=b"\x00iOS", andr=b"\x00and"),
     "original_size" / Int32ul,
     "packed_size" / Int24ul,
     "vromfs_type" / vromfs_type,
     "vromfs_packed_type" / Computed(lambda ctx: "zstd_packed" if ctx.vromfs_type == "zstd_packed" else
-        ("not_packed" if ctx.vromfs_type == "maybe_packed" and ctx.packed_size == 0 else
-        ("zlib_packed" if ctx.vromfs_type == "maybe_packed" and ctx.packed_size > 0 else "hoo")))
+    ("not_packed" if ctx.vromfs_type == "maybe_packed" and ctx.packed_size == 0 else
+     ("zlib_packed" if ctx.vromfs_type == "maybe_packed" and ctx.packed_size > 0 else "hoo")))
 )
 
 vromfs_body = Struct(
@@ -140,6 +154,10 @@ vromfs_body = Struct(
 
 vromfs_file = Struct(
     "header" / vromfs_header,
+    "ext_header" / If(
+        this.header.magic == "vrfx",
+        vromfs_ext_header),
     "body" / vromfs_body,
-    "tail" / Bytes(272)
+    # "tail" / Bytes(272)
+    "tail" / GreedyBytes
 )
